@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "template": {
+    "projectId": "hvshm_host",
+    "artifactName": "hvshm_host",
+    "buildType": "QnxRecMake",
+    "language": "c",
+    "archlist": "x86_64,aarch64le",
+    "artifactType": "Executable"
+  }
+}
