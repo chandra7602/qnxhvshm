@@ -6,6 +6,7 @@
 #include <linux/io-64-nonatomic-lo-hi.h>
 #include <linux/jiffies.h>
 #include <linux/miscdevice.h>
+#include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
@@ -32,12 +33,19 @@
 
 struct hvshm_dev {
 	struct miscdevice misc;
-	void __iomem *factory;                 /* mapped for the module lifetime */
+
+	/* Factory page (guest-physical register window, WB-cached RAM). */
+	void *factory;
 	char region_name[GUEST_SHM_MAX_NAME];
 	u32 req_pages;
 	int irq;
 
-	void __iomem *ctrl;
+	/*
+	 * Control page + data region: one contiguous memremap() of
+	 * (pages + 1) 4K pages.  'ctrl' points at the control page,
+	 * 'region' points at the first byte of the data area.
+	 */
+	void *ctrl;
 	void *region;
 	size_t region_bytes;
 	u32 conn_idx;
@@ -68,27 +76,47 @@ static int hvshm_status_to_errno(u32 status) {
 
 static int hvshm_attach(struct hvshm_dev *hd) {
 	struct device *dev = hd->misc.parent;
-	char name[GUEST_SHM_MAX_NAME] = {0}
 	phys_addr_t ctrl_phys;
 	u32 status, pages;
+	void *map;
 	int ret;
 
-	memcpy(name, hd->region_name, strlen(hd->region_name));
-	memcpy_toio(hd->factory + FACT_REG(name), name, sizeof(name));
-	writel(hd->req_pages, hd->factory + FACT_REG(size));
+	/*
+	 * The vdev latches on the write to 'size' and requires the name to
+	 * be visible first.  guest_shm_create() carries the compiler barrier
+	 * that keeps the name store ahead of the size store.
+	 */
+	strscpy((char *)hd->factory + FACT_REG(name), hd->region_name,
+		GUEST_SHM_MAX_NAME);
+	guest_shm_create(hd->factory, hd->req_pages);
 
 	status = readl(hd->factory + FACT_REG(status));
 	if (status != GSS_OK) {
-		dev_err(dev, "attach '%s' failed, vdev status %u\n", hd->region_name, status);
+		dev_err(dev, "attach '%s' failed, vdev status %u\n",
+			hd->region_name, status);
 		return hvshm_status_to_errno(status);
 	}
 
+	/*
+	 * The creator picks the actual size; read it back.  shmem is the
+	 * physical address of the control page, data follows at +4K.
+	 */
 	ctrl_phys = readq(hd->factory + FACT_REG(shmem));
 	pages = readl(hd->factory + FACT_REG(size));
-	if (!ctrl_phys || !pages) return -ENXIO;
+	if (!ctrl_phys || !pages || pages > (SIZE_MAX / SZ_4K))
+		return -ENXIO;
 
-	hd->ctrl = ioremap(ctrl_phys, SZ_4K);
-	if (!hd->ctrl) return -ENOMEM;
+	/*
+	 * Control page and data area live in normal guest RAM; map them
+	 * with memremap(MEMREMAP_WB), not ioremap().
+	 */
+	map = memremap(ctrl_phys, ((size_t)pages + 1) * SZ_4K, MEMREMAP_WB);
+	if (!map)
+		return -ENOMEM;
+
+	hd->ctrl = map;
+	hd->region = (char *)map + SZ_4K;
+	hd->region_bytes = (size_t)pages * SZ_4K;
 
 	hd->conn_idx = readl(hd->ctrl + CTRL_REG(idx));
 	if (hd->conn_idx >= GUEST_SHM_MAX_CLIENTS) {
@@ -96,27 +124,26 @@ static int hvshm_attach(struct hvshm_dev *hd) {
 		goto err_detach;
 	}
 
-	hd->region_bytes = (size_t)pages * SZ_4K;
-	hd->region = memremap(ctrl_phys + SZ_4K, hd->region_bytes, MEMREMAP_WB);
-	if (!hd->region) {
-		ret = -ENOMEM;
-		goto err_detach;
-	}
 	return 0;
 
 err_detach:
 	writel(0, hd->ctrl + CTRL_REG(detach));
-	iounmap(hd->ctrl);
+	memunmap(hd->ctrl);
 	hd->ctrl = NULL;
+	hd->region = NULL;
+	hd->region_bytes = 0;
 	return ret;
 }
 
 static void hvshm_detach(struct hvshm_dev *hd) {
+	if (!hd->ctrl)
+		return;
+
 	writel(0, hd->ctrl + CTRL_REG(detach));
-	memunmap(hd->region);
-	iounmap(hd->ctrl);
-	hd->region = NULL;
+	memunmap(hd->ctrl);
 	hd->ctrl = NULL;
+	hd->region = NULL;
+	hd->region_bytes = 0;
 	hd->bound = false;
 }
 
@@ -125,6 +152,10 @@ static bool hvshm_sync_status(struct hvshm_dev *hd) {
 	unsigned long flags;
 	u32 st, attach, notified, up, down;
 
+	if (!hd->ctrl)
+		return false;
+
+	/* Single read: status is a combined notify + attach bitmap. */
 	st = readl(hd->ctrl + CTRL_REG(status));
 	attach = st >> GUEST_SHM_MAX_CLIENTS;
 	notified = st & HVSHM_CLIENT_MASK;
@@ -143,7 +174,9 @@ static bool hvshm_sync_status(struct hvshm_dev *hd) {
 static irqreturn_t hvshm_irq(int irq, void *arg) {
 	struct hvshm_dev *hd = arg;
 
-	if (!hvshm_sync_status(hd)) return IRQ_NONE;
+	if (!hvshm_sync_status(hd))
+		return IRQ_NONE;
+
 	wake_up_interruptible(&hd->wq);
 	return IRQ_HANDLED;
 }
@@ -151,7 +184,11 @@ static irqreturn_t hvshm_irq(int irq, void *arg) {
 static int hvshm_ensure_bound(struct hvshm_dev *hd) {
 	int rc;
 
-	if (hd->bound && hvshm_channel_alive(&hd->ch)) return 0;
+	if (!hd->region)
+		return -ENODEV;
+	if (hd->bound && hvshm_channel_alive(&hd->ch))
+		return 0;
+
 	rc = hvshm_guest_attach(hd->region, hd->region_bytes, &hd->ch);
 	hd->bound = (rc == 0);
 	return rc;
@@ -160,7 +197,10 @@ static int hvshm_ensure_bound(struct hvshm_dev *hd) {
 static bool hvshm_rx_ready(struct hvshm_dev *hd) {
 	struct hvshm_header *h = hd->region;
 
-	if (HVSHM_LOAD_ACQ(&h->magic) != HVSHM_MAGIC) return false;
+	if (!h)
+		return false;
+	if (HVSHM_LOAD_ACQ(&h->magic) != HVSHM_MAGIC)
+		return false;
 	return HVSHM_LOAD_ACQ(&h->h2g.head) != HVSHM_LOAD_RLX(&h->h2g.tail);
 }
 
@@ -180,8 +220,9 @@ static int hvshm_pop_message(struct hvshm_dev *hd, struct hvshm_event *ev) {
 	int rc, ret;
 
 	mutex_lock(&hd->ring_lock);
-	if (hvshm_ensure_bound(hd)) {
-		ret = 0;                     /* host not up: nothing to deliver */
+	rc = hvshm_ensure_bound(hd);
+	if (rc) {
+		ret = 0;                 /* host not up: nothing to deliver */
 		goto out;
 	}
 
@@ -218,10 +259,12 @@ static int hvshm_take_event(struct hvshm_dev *hd, struct hvshm_event *ev) {
 		hd->pend_conn &= ~BIT(ev->conn_idx);
 	}
 	spin_unlock_irqrestore(&hd->lock, flags);
-	if (mask) return 1;
+	if (mask)
+		return 1;
 
 	ret = hvshm_pop_message(hd, ev);
-	if (ret) return ret;
+	if (ret)
+		return ret;
 
 	spin_lock_irqsave(&hd->lock, flags);
 	mask = hd->pend_disc;
@@ -240,22 +283,32 @@ static long hvshm_ioc_wait(struct hvshm_dev *hd, struct hvshm_wait_arg __user *u
 	long left = 0;
 	int rc;
 
-	if (get_user(timeout_ms, &uarg->timeout_ms)) return -EFAULT;
-	if (timeout_ms != HVSHM_WAIT_FOREVER) left = msecs_to_jiffies(timeout_ms);
+	if (get_user(timeout_ms, &uarg->timeout_ms))
+		return -EFAULT;
+	if (timeout_ms != HVSHM_WAIT_FOREVER)
+		left = msecs_to_jiffies(timeout_ms);
 
 	for (;;) {
 		rc = hvshm_take_event(hd, &ev);
-		if (rc < 0) return rc;
-		if (rc == 1) break;
+		if (rc < 0)
+			return rc;
+		if (rc == 1)
+			break;
 
-		if (timeout_ms == 0) return -EAGAIN;
+		if (timeout_ms == 0)
+			return -EAGAIN;
 		if (timeout_ms == HVSHM_WAIT_FOREVER) {
-			rc = wait_event_interruptible(hd->wq, hvshm_has_event(hd));
-			if (rc) return rc;
+			rc = wait_event_interruptible(hd->wq,
+						      hvshm_has_event(hd));
+			if (rc)
+				return rc;
 		} else {
-			left = wait_event_interruptible_timeout(hd->wq, hvshm_has_event(hd), left);
-			if (left < 0) return left;
-			if (left == 0) return -ETIMEDOUT;
+			left = wait_event_interruptible_timeout(hd->wq,
+					hvshm_has_event(hd), left);
+			if (left < 0)
+				return left;
+			if (left == 0)
+				return -ETIMEDOUT;
 		}
 	}
 
@@ -264,22 +317,30 @@ static long hvshm_ioc_wait(struct hvshm_dev *hd, struct hvshm_wait_arg __user *u
 
 static long hvshm_ioc_send(struct hvshm_dev *hd, const struct hvshm_send_arg __user *uarg) {
 	struct hvshm_send_arg a;
-	u32 host_idx, mask;
+	u32 mask;
 	int rc;
 
-	if (copy_from_user(&a, uarg, sizeof(a))) return -EFAULT;
-	if (a.len > HVSHM_MSG_MAX_PAYLOAD) return -EMSGSIZE;
+	if (copy_from_user(&a, uarg, sizeof(a)))
+		return -EFAULT;
+	if (a.len > HVSHM_MSG_MAX_PAYLOAD)
+		return -EMSGSIZE;
 
 	mutex_lock(&hd->ring_lock);
 	rc = hvshm_ensure_bound(hd);
-	if (!rc) rc = hvshm_send(&hd->ch, a.msg_type, a.payload, a.len);
-	host_idx = hd->bound ? hd->ch.hdr->host_idx : HVSHM_NO_CONN;
+	if (!rc)
+		rc = hvshm_send(&hd->ch, a.msg_type, a.payload, a.len);
 	mutex_unlock(&hd->ring_lock);
-	if (rc) return rc;
+	if (rc)
+		return rc;
 
-	/* Wake only the host if we know its index, otherwise everybody else. */
-	mask = (host_idx < GUEST_SHM_MAX_CLIENTS) ? BIT(host_idx) : ~0u;
-	writel(mask, hd->ctrl + CTRL_REG(notify));
+	/*
+	 * ~0 means "every peer but me".  Like the reference driver, this is
+	 * the safe default: we do not know for certain that the only peer
+	 * is the QNX host, and the vdev masks out self anyway.
+	 */
+	mask = ~0u;
+	if (hd->ctrl)
+		writel(mask, hd->ctrl + CTRL_REG(notify));
 	return 0;
 }
 
@@ -298,7 +359,7 @@ static long hvshm_ioc_info(struct hvshm_dev *hd, struct hvshm_info __user *uarg)
 
 	mutex_lock(&hd->ring_lock);
 	if (!hvshm_ensure_bound(hd)) {
-		host_idx = hd->ch.hdr->host_idx;
+		host_idx = HVSHM_LOAD_ACQ(&hd->ch.hdr->host_idx);
 		info.ring_bytes = hd->ch.rx.size;
 	}
 	mutex_unlock(&hd->ring_lock);
@@ -333,14 +394,19 @@ static int hvshm_open(struct inode *inode, struct file *filp) {
 	struct hvshm_dev *hd = container_of(filp->private_data, struct hvshm_dev, misc);
 	int ret;
 
-	if (test_and_set_bit(HVSHM_F_OPEN, &hd->flags)) return -EBUSY;                 /* one owner of the protocol */
+	if (test_and_set_bit(HVSHM_F_OPEN, &hd->flags))
+		return -EBUSY;
 
+	mutex_lock(&hd->ring_lock);
 	ret = hvshm_attach(hd);
-	if (ret) goto err_clear;
+	mutex_unlock(&hd->ring_lock);
+	if (ret)
+		goto err_clear;
 
 	/*
-	 * Start from "only we are attached"; the first sync below reports every
-	 * peer that is already connected as a synthetic PEER_CONNECTED event.
+	 * Start from "only we are attached"; the first sync below reports
+	 * every peer that is already connected as a synthetic
+	 * PEER_CONNECTED event.
 	 */
 	spin_lock_irq(&hd->lock);
 	hd->attach_list = BIT(hd->conn_idx);
@@ -349,13 +415,15 @@ static int hvshm_open(struct inode *inode, struct file *filp) {
 	spin_unlock_irq(&hd->lock);
 
 	ret = request_irq(hd->irq, hvshm_irq, IRQF_SHARED, DRV_NAME, hd);
-	if (ret) goto err_detach;
+	if (ret)
+		goto err_detach;
 	hvshm_sync_status(hd);
 
 	/* Drop whatever the host queued for a previous session. */
 	mutex_lock(&hd->ring_lock);
 	hd->bound = false;
-	if (!hvshm_ensure_bound(hd)) hvshm_rx_flush(&hd->ch);
+	if (!hvshm_ensure_bound(hd))
+		hvshm_rx_flush(&hd->ch);
 	mutex_unlock(&hd->ring_lock);
 
 	filp->private_data = hd;
@@ -395,28 +463,40 @@ static int hvshm_probe(struct platform_device *pdev) {
 	int ret;
 
 	BUILD_BUG_ON(HVSHM_EVENT_PAYLOAD_MAX != HVSHM_MSG_MAX_PAYLOAD);
+	BUILD_BUG_ON(GUEST_SHM_MAX_CLIENTS == 0 ||
+		     GUEST_SHM_MAX_CLIENTS > 16);
 
-	if (PAGE_SIZE != SZ_4K) return -EOPNOTSUPP;            /* vdev page granule is 4 KiB */
+	if (PAGE_SIZE != SZ_4K)
+		return -EOPNOTSUPP;      /* vdev page granule is 4 KiB */
 
 	hd = devm_kzalloc(dev, sizeof(*hd), GFP_KERNEL);
-	if (!hd) return -ENOMEM;
+	if (!hd)
+		return -ENOMEM;
 	spin_lock_init(&hd->lock);
 	mutex_init(&hd->ring_lock);
 	init_waitqueue_head(&hd->wq);
 
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	hd->irq = platform_get_irq(pdev, 0);
-	if (!res || hd->irq < 0) return hd->irq < 0 ? hd->irq : -EINVAL;
+	if (!res || hd->irq < 0)
+		return hd->irq < 0 ? hd->irq : -EINVAL;
 
 	hd->req_pages = HVSHM_DEFAULT_PAGES;
 	device_property_read_string(dev, "hvshm,region-name", &name);
 	device_property_read_u32(dev, "hvshm,size-pages", &hd->req_pages);
-	if (strlen(name) >= GUEST_SHM_MAX_NAME) return -ENAMETOOLONG;
+	if (strlen(name) >= GUEST_SHM_MAX_NAME)
+		return -ENAMETOOLONG;
 	strscpy(hd->region_name, name, sizeof(hd->region_name));
 
-	/* Factory page: trapped/emulated registers -> device mapping. */
-	hd->factory = devm_ioremap(dev, res->start, resource_size(res));
-	if (!hd->factory) return -ENOMEM;
+	/*
+	 * Factory page: a register window backed by normal guest RAM, so
+	 * memremap(MEMREMAP_WB) rather than ioremap().
+	 */
+	hd->factory = devm_memremap(dev, res->start, resource_size(res),
+				    MEMREMAP_WB);
+	if (IS_ERR(hd->factory))
+		return PTR_ERR(hd->factory);
+
 	if (readq(hd->factory + FACT_REG(signature)) != GUEST_SHM_SIGNATURE) {
 		dev_err(dev, "factory signature mismatch, wrong address?\n");
 		return -ENODEV;
@@ -428,23 +508,32 @@ static int hvshm_probe(struct platform_device *pdev) {
 	hd->misc.mode   = 0660;
 	hd->misc.parent = dev;
 	ret = misc_register(&hd->misc);
-	if (ret) return ret;
+	if (ret)
+		return ret;
 
 	platform_set_drvdata(pdev, hd);
-	dev_info(dev, "ready: region '%s', irq %d (attaches on open)\n", hd->region_name, hd->irq);
+	dev_info(dev, "ready: region '%s', irq %d (attaches on open)\n",
+		 hd->region_name, hd->irq);
 	return 0;
 }
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)
-static void hvshm_remove(struct platform_device *pdev) {
-	misc_deregister(&((struct hvshm_dev *)platform_get_drvdata(pdev))->misc);
-}
-#else
-static int hvshm_remove(struct platform_device *pdev) {
-	misc_deregister(&((struct hvshm_dev *)platform_get_drvdata(pdev))->misc);
+static int hvshm_remove(struct platform_device *pdev)
+{
+	struct hvshm_dev *hd = platform_get_drvdata(pdev);
+
+	/*
+	 * Refuse unload while the device is open: free_irq/detach must be
+	 * driven by release(), otherwise the still-open file would keep
+	 * private_data pointing into memory the device core is about to
+	 * free.  This mirrors what the reference driver achieves by
+	 * owning the char device and destroying nodes explicitly.
+	 */
+	if (test_bit(HVSHM_F_OPEN, &hd->flags))
+		return -EBUSY;
+
+	misc_deregister(&hd->misc);
 	return 0;
 }
-#endif
 
 static const struct of_device_id hvshm_of_match[] = {
 	{ .compatible = "hvshm,guest-shm" },
